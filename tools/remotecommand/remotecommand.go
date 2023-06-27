@@ -17,12 +17,13 @@ limitations under the License.
 package remotecommand
 
 import (
+	"context"
 	"fmt"
 	"io"
+	"k8s.io/apimachinery/pkg/util/runtime"
+	"k8s.io/klog/v2"
 	"net/http"
 	"net/url"
-
-	"k8s.io/klog/v2"
 
 	"k8s.io/apimachinery/pkg/util/httpstream"
 	"k8s.io/apimachinery/pkg/util/remotecommand"
@@ -48,6 +49,7 @@ type Executor interface {
 	// is set, the stderr stream is not used (raw TTY manages stdout and stderr over the
 	// stdout stream).
 	Stream(options StreamOptions) error
+	StreamWithContext(ctx context.Context, options StreamOptions) error
 }
 
 type streamCreator interface {
@@ -139,4 +141,64 @@ func (e *streamExecutor) Stream(options StreamOptions) error {
 	}
 
 	return streamer.stream(conn)
+}
+
+// newConnectionAndStream creates a new SPDY connection and a stream protocol handler upon it.
+func (e *streamExecutor) newConnectionAndStream(ctx context.Context, options StreamOptions) (httpstream.Connection, streamProtocolHandler, error) {
+	req, err := http.NewRequestWithContext(ctx, e.method, e.url.String(), nil)
+	if err != nil {
+		return nil, nil, fmt.Errorf("error creating request: %v", err)
+	}
+
+	conn, protocol, err := spdy.Negotiate(
+		e.upgrader,
+		&http.Client{Transport: e.transport},
+		req,
+		e.protocols...,
+	)
+	if err != nil {
+		return nil, nil, err
+	}
+
+	var streamer streamProtocolHandler
+
+	switch protocol {
+	case remotecommand.StreamProtocolV4Name:
+		streamer = newStreamProtocolV4(options)
+	case remotecommand.StreamProtocolV3Name:
+		streamer = newStreamProtocolV3(options)
+	case remotecommand.StreamProtocolV2Name:
+		streamer = newStreamProtocolV2(options)
+	case "":
+		klog.V(4).Infof("The server did not negotiate a streaming protocol version. Falling back to %s", remotecommand.StreamProtocolV1Name)
+		fallthrough
+	case remotecommand.StreamProtocolV1Name:
+		streamer = newStreamProtocolV1(options)
+	}
+
+	return conn, streamer, nil
+}
+
+// StreamWithContext opens a protocol streamer to the server and streams until a client closes
+// the connection or the server disconnects or the context is done.
+func (e *streamExecutor) StreamWithContext(ctx context.Context, options StreamOptions) error {
+	conn, streamer, err := e.newConnectionAndStream(ctx, options)
+	if err != nil {
+		return err
+	}
+	defer conn.Close()
+
+	errorChan := make(chan error, 1)
+	go func() {
+		defer runtime.HandleCrash()
+		defer close(errorChan)
+		errorChan <- streamer.stream(conn)
+	}()
+
+	select {
+	case err := <-errorChan:
+		return err
+	case <-ctx.Done():
+		return ctx.Err()
+	}
 }
